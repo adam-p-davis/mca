@@ -1,2 +1,2 @@
 # mca
-bachelor's thesis code reposity
+bachelor's thesis code repository
