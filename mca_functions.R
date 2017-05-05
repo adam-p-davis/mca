@@ -2,6 +2,7 @@
 library(rootSolve)
 library(purrr)
 library(ggplot2)
+library(parallel)
 
 # aggregate impulse response curve
 f <- function(t, t_start = 0, tau = 1/exp(1)){
@@ -91,7 +92,7 @@ ell <- function(a_s, b_s){
 make_M <- function(t_list, h, tau = 1/exp(1), multi = TRUE, ones = TRUE){
   # multi is for multiple channels
   # ones = TRUE if we want intercept in matrix
-  no_cores <- detectCores() - 1
+  no_cores <- detectCores() - 4
   on.exit(stopCluster(cl))
   cl <- makeCluster(no_cores, type = 'FORK')
   
@@ -124,7 +125,6 @@ make_M <- function(t_list, h, tau = 1/exp(1), multi = TRUE, ones = TRUE){
   
   M <- data.frame(t(M))
   names(M) <- c('one', channels)
-  
   if(ones) return(M)
   return(M[,2:nrows])
   
@@ -174,6 +174,7 @@ grad_h <- function(b, beta, M, epsilon = 10e-6, h, t_list){
   return(sum(diag(t(grad_obs) %*% dM_dh)))
 }
 
+
 # This is the cost that we want to minimize actually
 # Runtime is too high due to matrix reconfiguration
 cost_h <- function(beta_h, b, t_list, tau = 1/exp(1)){
@@ -185,18 +186,17 @@ cost_h <- function(beta_h, b, t_list, tau = 1/exp(1)){
 }
 
 # the fucnction we use to run the analysis for a set of h values
-mca_thresh_optim <- function(b, t_list = NULL, h_s = NULL, tau = 1/exp(1), M_s = NULL){
+mca_thresh_optim <- function(b, t_list = NULL, h_s = NULL, tau = 1/exp(1), M_s = NULL, ones = TRUE){
   # M_s can be pre-processed and in parallel in a list with h
   if(is.null(M_s)){
     if(is.null(h_s)) stop('No threshold values specified.')
     if(is.null(t_list)) stop('No list of timestamps provided.')
     M_s <- lapply(h_s, function(x){
-      return(make_M(t_list, x))
+      return(make_M(t_list, x, ones = ones))
     })
   }
   
   n <- ncol(M_s[[1]])
-  
   models <- lapply(M_s, function(x){
     beta_guess <- optim(rep(0, n), loss, b = b, M = x)
     return(list(beta = beta_guess$par, exp_beta = exp(beta_guess$par),
@@ -233,12 +233,12 @@ log_reg <- function(b, M, epsilon_grad = 10e-6,
 }
 
 # This is the manual gradient descent
-mca_thresh_adam <- function(b, t_list = NULL, h_s = NULL, tau = 1/exp(1), M_s = NULL){
+mca_thresh_adam <- function(b, t_list = NULL, h_s = NULL, tau = 1/exp(1), M_s = NULL, ones = TRUE){
   if(is.null(M_s)){
     if(is.null(h_s)) stop('No threshold values specified.')
     if(is.null(t_list)) stop('No list of timestamps provided.')
     M_s <- lapply(h_s, function(x){
-      return(make_M(t_list, x))
+      return(make_M(t_list, x, ones = ones))
     })
   }
   
@@ -306,31 +306,90 @@ id_spikes <- function(signals){
 }
 
 # optimization with binary search over all parameters
-opt_bh <- function(b, t_list, h_min, h_max, h_len_max = 7, M_s = NULL){
-  h_ss <- list(h_len_max)
-  h_len <- 1
-  h_ss[[h_len]] <- (h_min + h_max)/2
-  M_ss <- M_s
-  models <- list(h_len_max)
-  grads <- models
-  
-  while(h_len < h_len_max){
-    print(h_len)
-    print(h_ss[[h_len]])
-    models[[h_len]] <- unlist(mca_thresh_optim(b, t_list, M_s = M_ss[[h_len]], h_s = h_ss[[h_len]]), 
-                              recursive = FALSE)
-    print(models[[h_len]])
-    grads[[h_len]] <- grad_h(b, models[[h_len]]$beta, models[[h_len]]$M, 
-                             h = h_ss[[h_len]], t_list = t_list, epsilon = 1/2^(h_len+3))
-    if(grads[[h_len]] >= 0){
-      h_ss[[h_len + 1]] <- (h_ss[[h_len]] + h_min)/2
-      h_max <- h_ss[[h_len]]
-    } else {
-      h_ss[[h_len + 1]] <- (h_ss[[h_len]] + h_max)/2
-      h_min <- h_ss[[h_len]]
+opt_bh <- function(b, t_list, h_min, h_max, h_len_max = 7, M_s = NULL, ones = TRUE,
+                   check_both_grads = FALSE, grid_h = FALSE){
+  if(grid_h){
+    
+    h_ss <- as.list(seq(h_min, h_max, length.out = h_len_max))
+    models <- lapply(seq_along(h_ss), function(x){
+      ret <- unlist(mca_thresh_optim(b, t_list, M_s = M_s[[x]], h_s = h_ss[[x]], ones = ones),
+                    recursive = FALSE)
+      return(ret)
+    })
+    grads <- NULL
+    
+  } else {
+    
+    h_ss <- list(h_len_max)
+    h_len <- 1
+    h_ss[[h_len]] <- (h_min + h_max)/2
+    M_ss <- M_s
+    models <- list(h_len_max)
+    grads <- models
+    
+    while(h_len < h_len_max){
+      
+      print(h_len)
+      print(h_ss[[h_len]])
+      models[[h_len]] <- unlist(mca_thresh_optim(b, t_list, M_s = M_ss[[h_len]], h_s = h_ss[[h_len]], ones = ones), 
+                                recursive = FALSE)
+      print(models[[h_len]])
+      
+      grads[[h_len]] <- grad_h(b, models[[h_len]]$beta, models[[h_len]]$M, 
+                               h = h_ss[[h_len]], 
+                               t_list = t_list, 
+                               epsilon = ifelse(h_len == 1, h_ss[[h_len]]/8, (h_ss[[h_len]] - h_ss[[h_len - 1]])/8))
+      if(check_both_grads){
+        
+        down_grad <- grad_h(b, models[[h_len]]$beta, models[[h_len]]$M, 
+                            h = h_ss[[h_len]], 
+                            t_list = t_list, 
+                            epsilon = ifelse(h_len == 1, -h_ss[[h_len]]/8, -(h_ss[[h_len]] - h_ss[[h_len - 1]])/8))
+        
+      }
+      
+      if(is.nan(grads[[h_len]]) || (is.nan(down_grad) && check_both_grads)){
+        
+        h_ss[[h_len]] <- h_ss[[h_len]] + rnorm(1, sd = .05)
+        next
+        
+      }
+      
+      if(check_both_grads){
+        
+        if(grads[[h_len]] >= down_grad){
+          h_ss[[h_len + 1]] <- h_ss[[h_len]] - (h_ss[[h_len]] - h_min)/16
+          h_max <- h_ss[[h_len]]
+          grads[[h_len]] <- down_grad
+          
+        } else {
+          
+          h_ss[[h_len + 1]] <- h_ss[[h_len]] + (h_max - h_ss[[h_len]])/16
+          h_min <- h_ss[[h_len]]
+          
+        }
+      } else {
+        
+        if(grads[[h_len]] >= 0){
+          
+          h_ss[[h_len + 1]] <- h_ss[[h_len]] - (h_ss[[h_len]] - h_min)/16
+          h_max <- h_ss[[h_len]]
+          
+        } else {
+          
+          h_ss[[h_len + 1]] <- h_ss[[h_len]] + (h_max - h_ss[[h_len]])/16
+          h_min <- h_ss[[h_len]]
+          
+        }
+      }
+      
+      h_len <- h_len + 1
     }
-
-    h_len <- h_len + 1
+    
+    h_ss[[h_len]] <- NULL
+    
   }
+  
   return(list(models = models, h_s = h_ss, grads = grads))
 }
+
